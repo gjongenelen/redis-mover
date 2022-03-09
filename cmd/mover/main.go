@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,6 +20,7 @@ func main() {
 	isExport := flag.Bool("export", false, "export redis to file")
 	isImport := flag.Bool("import", false, "import redis to file")
 	dataFile := flag.String("file", "", "path to data file")
+	pattern := flag.String("pattern", "", "pattern to export")
 	redis := flag.String("redis", "", "url to redis")
 
 	flag.Parse()
@@ -39,7 +41,7 @@ func main() {
 	}
 
 	if *isExport {
-		exportFn(*redis, *dataFile)
+		exportFn(*redis, *dataFile, *pattern)
 	}
 	if *isImport {
 		importFn(*redis, *dataFile)
@@ -60,7 +62,8 @@ func promptConfirm() bool {
 	return strings.ToLower(input.Text()) == "y"
 }
 
-func exportFn(redis string, file string) {
+func exportFn(redis string, file string, pattern string) {
+	redisParts := strings.Split(redis, "@")
 	fmt.Printf("Exporting data from redis (%s) to data-file (%s)\n", redis, file)
 	if !promptConfirm() {
 		fmt.Printf("\nAborting...")
@@ -72,13 +75,17 @@ func exportFn(redis string, file string) {
 		os.Exit(1)
 	}
 
+	db := 0
+	if len(redisParts) > 1 {
+		db, _ = strconv.Atoi(redisParts[1])
+	}
 	rdb := goRedis.NewClient(&goRedis.Options{
-		Addr:     redis,
+		Addr:     redisParts[0],
 		Password: "",
-		DB:       0,
+		DB:       db,
 	})
 
-	keys, err := rdb.Keys(context.Background(), "*").Result()
+	keys, err := rdb.Keys(context.Background(), pattern+"*").Result()
 	if err != nil {
 		fmt.Println(err.Error())
 		os.Exit(1)
@@ -121,6 +128,7 @@ func exportFn(redis string, file string) {
 }
 
 func importFn(redis string, file string) {
+	redisParts := strings.Split(redis, "@")
 	fmt.Printf("Importing data from data-file (%s) to redis (%s)\n", file, redis)
 	if !promptConfirm() {
 		fmt.Printf("\nAborting...")
@@ -143,10 +151,14 @@ func importFn(redis string, file string) {
 		os.Exit(1)
 	}
 
+	db := 0
+	if len(redisParts) > 1 {
+		db, _ = strconv.Atoi(redisParts[1])
+	}
 	rdb := goRedis.NewClient(&goRedis.Options{
-		Addr:     redis,
+		Addr:     redisParts[0],
 		Password: "",
-		DB:       0,
+		DB:       db,
 	})
 
 	for key, value := range data.Data {
