@@ -51,6 +51,7 @@ func main() {
 type Data struct {
 	DumpStart time.Time         `json:"dump_start"`
 	DumpEnd   time.Time         `json:"dump_end"`
+	Db        int               `json:"db"`
 	Data      map[string]string `json:"data"`
 }
 
@@ -75,55 +76,85 @@ func exportFn(redis string, file string, pattern string) {
 		os.Exit(1)
 	}
 
-	db := 0
+	dbs := []int{}
 	if len(redisParts) > 1 {
-		db, _ = strconv.Atoi(redisParts[1])
-	}
-	rdb := goRedis.NewClient(&goRedis.Options{
-		Addr:     redisParts[0],
-		Password: "",
-		DB:       db,
-	})
-
-	keys, err := rdb.Keys(context.Background(), pattern+"*").Result()
-	if err != nil {
-		fmt.Println(err.Error())
-		os.Exit(1)
+		for _, dbnum := range strings.Split(redisParts[1], ",") {
+			dbint, err := strconv.Atoi(dbnum)
+			if err == nil {
+				dbs = append(dbs, dbint)
+			}
+		}
+	} else {
+		dbs = append(dbs, 0)
 	}
 
-	data := Data{
-		DumpStart: time.Now(),
-		Data:      map[string]string{},
-	}
-	for _, key := range keys {
-		value, err := rdb.Get(context.Background(), key).Result()
+	dbData := map[int]Data{}
+	for _, dbNum := range dbs {
+		rdb := goRedis.NewClient(&goRedis.Options{
+			Addr:     redisParts[0],
+			Password: "",
+			DB:       dbNum,
+		})
+
+		keys, err := rdb.Keys(context.Background(), pattern+"*").Result()
 		if err != nil {
 			fmt.Println(err.Error())
 			os.Exit(1)
 		}
-		if _, ok := data.Data[key]; ok {
-			fmt.Printf("Conflicting key: %s\nAborting...", key)
+
+		data := Data{
+			DumpStart: time.Now(),
+			Db:        dbNum,
+			Data:      map[string]string{},
+		}
+		for _, key := range keys {
+			value, err := rdb.Get(context.Background(), key).Result()
+			if err != nil {
+				fmt.Println(err.Error())
+				os.Exit(1)
+			}
+			if _, ok := data.Data[key]; ok {
+				fmt.Printf("Conflicting key: %s\nAborting...", key)
+				os.Exit(1)
+			}
+			fmt.Printf("Exporting key: %s (len: %d)\n", key, len(value))
+			data.Data[key] = value
+		}
+		data.DumpEnd = time.Now()
+
+		dbData[dbNum] = data
+	}
+
+	if len(dbs) == 1 {
+		jsonDump, err := json.MarshalIndent(dbData[dbs[0]], "", " ")
+		if err != nil {
+			fmt.Println(err.Error())
 			os.Exit(1)
 		}
-		fmt.Printf("Exporting key: %s (len: %d)\n", key, len(value))
-		data.Data[key] = value
+
+		err = ioutil.WriteFile(file, jsonDump, 0644)
+		if err != nil {
+			fmt.Println(err.Error())
+			os.Exit(1)
+		}
+		fmt.Printf("\nExport done, %d keys exported", len(dbData[dbs[0]].Data))
+
+	} else {
+
+		jsonDump, err := json.MarshalIndent(dbData, "", " ")
+		if err != nil {
+			fmt.Println(err.Error())
+			os.Exit(1)
+		}
+
+		err = ioutil.WriteFile(file, jsonDump, 0644)
+		if err != nil {
+			fmt.Println(err.Error())
+			os.Exit(1)
+		}
+		fmt.Printf("\nExport done, %d dbs exported", len(dbData))
+
 	}
-
-	data.DumpEnd = time.Now()
-
-	jsonDump, err := json.MarshalIndent(data, "", " ")
-	if err != nil {
-		fmt.Println(err.Error())
-		os.Exit(1)
-	}
-
-	err = ioutil.WriteFile(file, jsonDump, 0644)
-	if err != nil {
-		fmt.Println(err.Error())
-		os.Exit(1)
-	}
-
-	fmt.Printf("\nExport done, %d keys exported", len(data.Data))
 
 }
 
