@@ -161,52 +161,67 @@ func exportFn(redis string, file string, pattern string) {
 func importFn(redis string, file string) {
 	redisParts := strings.Split(redis, "@")
 	fmt.Printf("Importing data from data-file (%s) to redis (%s)\n", file, redis)
+
 	if !promptConfirm() {
 		fmt.Printf("\nAborting...")
 		os.Exit(0)
 	}
 
-	jsonFile, err := os.Open(file)
+	byteValue, err := os.ReadFile(file)
 	if err != nil {
 		fmt.Println(err.Error())
 		os.Exit(1)
 	}
-	defer jsonFile.Close()
 
-	byteValue, _ := ioutil.ReadAll(jsonFile)
+	// Eerst proberen als multi-db export
+	multiData := map[int]Data{}
+	if err := json.Unmarshal(byteValue, &multiData); err == nil && len(multiData) > 0 {
+		for dbNum, data := range multiData {
+			importDataToDb(redisParts[0], dbNum, data)
+		}
+		fmt.Printf("\nImport done, %d dbs imported", len(multiData))
+		return
+	}
 
+	// Fallback: oude single-db export
 	data := Data{}
-	err = json.Unmarshal(byteValue, &data)
-	if err != nil {
+	if err := json.Unmarshal(byteValue, &data); err != nil {
 		fmt.Println(err.Error())
 		os.Exit(1)
 	}
 
-	db := 0
+	db := data.Db
 	if len(redisParts) > 1 {
 		db, _ = strconv.Atoi(redisParts[1])
 	}
+
+	importDataToDb(redisParts[0], db, data)
+	fmt.Printf("\nImport done, %d keys imported", len(data.Data))
+}
+
+func importDataToDb(redisAddr string, db int, data Data) {
 	rdb := goRedis.NewClient(&goRedis.Options{
-		Addr:     redisParts[0],
+		Addr:     redisAddr,
 		Password: "",
 		DB:       db,
 	})
+	defer rdb.Close()
 
 	for key, value := range data.Data {
-		curValue, err := rdb.Get(context.Background(), key).Result()
-		if err == nil && curValue != "" {
-			fmt.Printf("Key %s already exists.\nAborting...", key)
-			os.Exit(1)
-		}
-
-		fmt.Printf("Importing key: %s (len: %d)\n", key, len(value))
-		_, err = rdb.Set(context.Background(), key, value, 0).Result()
+		exists, err := rdb.Exists(context.Background(), key).Result()
 		if err != nil {
 			fmt.Println(err.Error())
 			os.Exit(1)
 		}
+		if exists > 0 {
+			fmt.Printf("Key %s already exists in db %d.\nAborting...", key, db)
+			os.Exit(1)
+		}
 
+		fmt.Printf("Importing key: %s to db %d (len: %d)\n", key, db, len(value))
+		if err := rdb.Set(context.Background(), key, value, 0).Err(); err != nil {
+			fmt.Println(err.Error())
+			os.Exit(1)
+		}
 	}
-
-	fmt.Printf("\nImport done, %d keys imported", len(data.Data))
 }
