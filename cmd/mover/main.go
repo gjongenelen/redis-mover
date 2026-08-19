@@ -49,11 +49,19 @@ func main() {
 }
 
 type Data struct {
-	DumpStart time.Time         `json:"dump_start"`
-	DumpEnd   time.Time         `json:"dump_end"`
-	Db        int               `json:"db"`
-	Data      map[string]string `json:"data"`
+	Version   int                   `json:"version"`
+	DumpStart time.Time             `json:"dump_start"`
+	DumpEnd   time.Time             `json:"dump_end"`
+	Db        int                   `json:"db"`
+	Data      map[string]DumpRecord `json:"data"`
 }
+
+type DumpRecord struct {
+	Dump      []byte `json:"dump"`
+	TTLMillis int64  `json:"ttl_ms"`
+}
+
+const exportFormatVersion = 1
 
 func promptConfirm() bool {
 	fmt.Printf("Continue? [y/N] ")
@@ -103,24 +111,49 @@ func exportFn(redis string, file string, pattern string) {
 		}
 
 		data := Data{
+			Version:   exportFormatVersion,
 			DumpStart: time.Now(),
 			Db:        dbNum,
-			Data:      map[string]string{},
+			Data:      map[string]DumpRecord{},
 		}
 		for _, key := range keys {
-			value, err := rdb.Get(context.Background(), key).Result()
+			dump, err := rdb.Dump(context.Background(), key).Result()
+			if err == goRedis.Nil {
+				// The key expired or was deleted after KEYS returned it.
+				continue
+			}
 			if err != nil {
 				fmt.Println(err.Error())
 				os.Exit(1)
 			}
+
+			ttl, err := rdb.PTTL(context.Background(), key).Result()
+			if err != nil {
+				fmt.Println(err.Error())
+				os.Exit(1)
+			}
+			if ttl == -2 {
+				// The key expired or was deleted after DUMP returned it.
+				continue
+			}
+
+			ttlMillis := int64(0)
+			if ttl != -1 {
+				ttlMillis = ttl.Milliseconds()
+			}
+
 			if _, ok := data.Data[key]; ok {
 				fmt.Printf("Conflicting key: %s\nAborting...", key)
 				os.Exit(1)
 			}
-			fmt.Printf("Exporting key: %s (len: %d)\n", key, len(value))
-			data.Data[key] = value
+			fmt.Printf("Exporting key: %s (dump len: %d, ttl: %dms)\n", key, len(dump), ttlMillis)
+			data.Data[key] = DumpRecord{
+				Dump:      []byte(dump),
+				TTLMillis: ttlMillis,
+			}
 		}
 		data.DumpEnd = time.Now()
+		rdb.Close()
 
 		dbData[dbNum] = data
 	}
@@ -177,15 +210,23 @@ func importFn(redis string, file string) {
 	multiData := map[int]Data{}
 	if err := json.Unmarshal(byteValue, &multiData); err == nil && len(multiData) > 0 {
 		for dbNum, data := range multiData {
+			if err := validateData(data); err != nil {
+				fmt.Println(err.Error())
+				os.Exit(1)
+			}
 			importDataToDb(redisParts[0], dbNum, data)
 		}
 		fmt.Printf("\nImport done, %d dbs imported", len(multiData))
 		return
 	}
 
-	// Fallback: oude single-db export
+	// Fallback: single-db export
 	data := Data{}
 	if err := json.Unmarshal(byteValue, &data); err != nil {
+		fmt.Println(err.Error())
+		os.Exit(1)
+	}
+	if err := validateData(data); err != nil {
 		fmt.Println(err.Error())
 		os.Exit(1)
 	}
@@ -199,6 +240,21 @@ func importFn(redis string, file string) {
 	fmt.Printf("\nImport done, %d keys imported", len(data.Data))
 }
 
+func validateData(data Data) error {
+	if data.Version != exportFormatVersion {
+		return fmt.Errorf("unsupported export format version %d (expected %d)", data.Version, exportFormatVersion)
+	}
+	for key, record := range data.Data {
+		if len(record.Dump) == 0 {
+			return fmt.Errorf("key %s has an empty dump", key)
+		}
+		if record.TTLMillis < 0 {
+			return fmt.Errorf("key %s has an invalid ttl: %dms", key, record.TTLMillis)
+		}
+	}
+	return nil
+}
+
 func importDataToDb(redisAddr string, db int, data Data) {
 	rdb := goRedis.NewClient(&goRedis.Options{
 		Addr:     redisAddr,
@@ -207,7 +263,7 @@ func importDataToDb(redisAddr string, db int, data Data) {
 	})
 	defer rdb.Close()
 
-	for key, value := range data.Data {
+	for key, record := range data.Data {
 		exists, err := rdb.Exists(context.Background(), key).Result()
 		if err != nil {
 			fmt.Println(err.Error())
@@ -218,8 +274,9 @@ func importDataToDb(redisAddr string, db int, data Data) {
 			os.Exit(1)
 		}
 
-		fmt.Printf("Importing key: %s to db %d (len: %d)\n", key, db, len(value))
-		if err := rdb.Set(context.Background(), key, value, 0).Err(); err != nil {
+		fmt.Printf("Importing key: %s to db %d (dump len: %d, ttl: %dms)\n", key, db, len(record.Dump), record.TTLMillis)
+		ttl := time.Duration(record.TTLMillis) * time.Millisecond
+		if err := rdb.Restore(context.Background(), key, ttl, string(record.Dump)).Err(); err != nil {
 			fmt.Println(err.Error())
 			os.Exit(1)
 		}
