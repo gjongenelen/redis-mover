@@ -70,3 +70,80 @@ func TestValidateDataRejectsInvalidRecord(t *testing.T) {
 		})
 	}
 }
+
+func TestParseRedisTargetSupportsPasswordInURL(t *testing.T) {
+	target, err := parseRedisTarget("redis://default:p%40ssword@redis.example.com:6380/4")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if target.options.Addr != "redis.example.com:6380" {
+		t.Fatalf("unexpected Redis address: %q", target.options.Addr)
+	}
+	if target.options.Username != "default" {
+		t.Fatalf("unexpected Redis username: %q", target.options.Username)
+	}
+	if target.options.Password != "p@ssword" {
+		t.Fatalf("unexpected Redis password: %q", target.options.Password)
+	}
+	if !target.databaseSpecified || len(target.databases) != 1 || target.databases[0] != 4 {
+		t.Fatalf("unexpected databases: specified=%v, databases=%v", target.databaseSpecified, target.databases)
+	}
+	if strings.Contains(target.displayURL, "p%40ssword") || strings.Contains(target.displayURL, "p@ssword") {
+		t.Fatalf("display URL exposes the password: %q", target.displayURL)
+	}
+}
+
+func TestParseRedisTargetSupportsDatabaseListInURL(t *testing.T) {
+	target, err := parseRedisTarget("redis://:secret@localhost:6379/0,2,5")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if target.options.Addr != "localhost:6379" {
+		t.Fatalf("unexpected Redis address: %q", target.options.Addr)
+	}
+	wantDatabases := []int{0, 2, 5}
+	if len(target.databases) != len(wantDatabases) {
+		t.Fatalf("unexpected databases: %v", target.databases)
+	}
+	for index, want := range wantDatabases {
+		if target.databases[index] != want {
+			t.Fatalf("unexpected databases: %v", target.databases)
+		}
+	}
+	if target.options.Password != "secret" {
+		t.Fatalf("unexpected password: %q", target.options.Password)
+	}
+}
+
+func TestParseRedisTargetRejectsLegacyAddress(t *testing.T) {
+	legacyAddresses := []string{
+		"localhost:6379@0,2,5",
+		"redis://:secret@localhost:6379@0,2,5",
+		"redis:localhost:6379/0,2,5",
+	}
+	for _, address := range legacyAddresses {
+		if _, err := parseRedisTarget(address); err == nil {
+			t.Fatalf("expected legacy address %q to be rejected", address)
+		}
+	}
+}
+
+func TestRedisURLWithoutDatabaseUsesDatabaseFromImport(t *testing.T) {
+	target, err := parseRedisTarget("redis://:secret@localhost:6379")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target.databaseSpecified {
+		t.Fatal("database should not be marked as specified")
+	}
+
+	options := target.optionsForDatabase(7)
+	if options.DB != 7 {
+		t.Fatalf("unexpected database: got %d, want 7", options.DB)
+	}
+	if options.Password != "secret" {
+		t.Fatalf("unexpected password: %q", options.Password)
+	}
+}

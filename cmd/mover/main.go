@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io/ioutil"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -21,7 +22,7 @@ func main() {
 	isImport := flag.Bool("import", false, "import redis to file")
 	dataFile := flag.String("file", "", "path to data file")
 	pattern := flag.String("pattern", "", "pattern to export")
-	redis := flag.String("redis", "", "url to redis")
+	redis := flag.String("redis", "", "Redis URL (for example redis://:password@localhost:6379/0,1,2)")
 
 	flag.Parse()
 
@@ -63,6 +64,98 @@ type DumpRecord struct {
 
 const exportFormatVersion = 1
 
+type redisTarget struct {
+	options           goRedis.Options
+	databases         []int
+	databaseSpecified bool
+	displayURL        string
+}
+
+func parseRedisTarget(value string) (redisTarget, error) {
+	parsedURL, err := url.Parse(value)
+	if err != nil {
+		return redisTarget{}, err
+	}
+	if parsedURL.Scheme == "" {
+		return redisTarget{}, fmt.Errorf("Redis URL must include a scheme, for example redis://localhost:6379/0")
+	}
+	switch parsedURL.Scheme {
+	case "redis", "rediss", "unix":
+	default:
+		return redisTarget{}, fmt.Errorf("unsupported Redis URL scheme %q", parsedURL.Scheme)
+	}
+	urlParts := strings.SplitN(value, "://", 2)
+	if len(urlParts) != 2 {
+		return redisTarget{}, fmt.Errorf("invalid Redis URL; expected %s://", parsedURL.Scheme)
+	}
+	if parsedURL.Scheme != "unix" {
+		authority := urlParts[1]
+		if separator := strings.IndexAny(authority, "/?#"); separator >= 0 {
+			authority = authority[:separator]
+		}
+		if strings.Count(authority, "@") > 1 || strings.Contains(parsedURL.Host, ",") {
+			return redisTarget{}, fmt.Errorf("invalid Redis URL; specify databases in the path, for example /0,1,2")
+		}
+	}
+
+	optionsURL := *parsedURL
+	databaseSpecified := parsedURL.Query().Has("db")
+	var databases []int
+
+	if parsedURL.Scheme != "unix" {
+		databasePath := strings.Trim(parsedURL.Path, "/")
+		if databasePath != "" {
+			databaseSpecified = true
+			databases, err = parseDatabaseList(databasePath)
+			if err != nil {
+				return redisTarget{}, err
+			}
+			if len(databases) > 1 && parsedURL.Query().Has("db") {
+				return redisTarget{}, fmt.Errorf("Redis databases cannot be specified in both the URL path and query")
+			}
+
+			// go-redis only accepts one database in the URL path. Parse the
+			// connection using the first database; each client gets its actual
+			// database through optionsForDatabase.
+			optionsURL.Path = "/" + strconv.Itoa(databases[0])
+			optionsURL.RawPath = ""
+		}
+	}
+
+	options, err := goRedis.ParseURL(optionsURL.String())
+	if err != nil {
+		return redisTarget{}, err
+	}
+	if len(databases) == 0 || parsedURL.Query().Has("db") {
+		databases = []int{options.DB}
+	}
+
+	return redisTarget{
+		options:           *options,
+		databases:         databases,
+		databaseSpecified: databaseSpecified,
+		displayURL:        parsedURL.Redacted(),
+	}, nil
+}
+
+func parseDatabaseList(value string) ([]int, error) {
+	databases := make([]int, 0, strings.Count(value, ",")+1)
+	for _, database := range strings.Split(value, ",") {
+		databaseNumber, err := strconv.Atoi(database)
+		if err != nil {
+			return nil, fmt.Errorf("invalid Redis database %q: %w", database, err)
+		}
+		databases = append(databases, databaseNumber)
+	}
+	return databases, nil
+}
+
+func (target redisTarget) optionsForDatabase(database int) *goRedis.Options {
+	options := target.options
+	options.DB = database
+	return &options
+}
+
 func promptConfirm() bool {
 	fmt.Printf("Continue? [y/N] ")
 	input := bufio.NewScanner(os.Stdin)
@@ -71,9 +164,14 @@ func promptConfirm() bool {
 	return strings.ToLower(input.Text()) == "y"
 }
 
-func exportFn(redis string, file string, pattern string) {
-	redisParts := strings.Split(redis, "@")
-	fmt.Printf("Exporting data from redis (%s) to data-file (%s)\n", redis, file)
+func exportFn(redisURL string, file string, pattern string) {
+	target, err := parseRedisTarget(redisURL)
+	if err != nil {
+		fmt.Println(err.Error())
+		os.Exit(1)
+	}
+
+	fmt.Printf("Exporting data from redis (%s) to data-file (%s)\n", target.displayURL, file)
 	if !promptConfirm() {
 		fmt.Printf("\nAborting...")
 		os.Exit(0)
@@ -84,25 +182,11 @@ func exportFn(redis string, file string, pattern string) {
 		os.Exit(1)
 	}
 
-	dbs := []int{}
-	if len(redisParts) > 1 {
-		for _, dbnum := range strings.Split(redisParts[1], ",") {
-			dbint, err := strconv.Atoi(dbnum)
-			if err == nil {
-				dbs = append(dbs, dbint)
-			}
-		}
-	} else {
-		dbs = append(dbs, 0)
-	}
+	dbs := target.databases
 
 	dbData := map[int]Data{}
 	for _, dbNum := range dbs {
-		rdb := goRedis.NewClient(&goRedis.Options{
-			Addr:     redisParts[0],
-			Password: "",
-			DB:       dbNum,
-		})
+		rdb := goRedis.NewClient(target.optionsForDatabase(dbNum))
 
 		keys, err := rdb.Keys(context.Background(), pattern+"*").Result()
 		if err != nil {
@@ -191,9 +275,14 @@ func exportFn(redis string, file string, pattern string) {
 
 }
 
-func importFn(redis string, file string) {
-	redisParts := strings.Split(redis, "@")
-	fmt.Printf("Importing data from data-file (%s) to redis (%s)\n", file, redis)
+func importFn(redisURL string, file string) {
+	target, err := parseRedisTarget(redisURL)
+	if err != nil {
+		fmt.Println(err.Error())
+		os.Exit(1)
+	}
+
+	fmt.Printf("Importing data from data-file (%s) to redis (%s)\n", file, target.displayURL)
 
 	if !promptConfirm() {
 		fmt.Printf("\nAborting...")
@@ -214,7 +303,7 @@ func importFn(redis string, file string) {
 				fmt.Println(err.Error())
 				os.Exit(1)
 			}
-			importDataToDb(redisParts[0], dbNum, data)
+			importDataToDb(target, dbNum, data)
 		}
 		fmt.Printf("\nImport done, %d dbs imported", len(multiData))
 		return
@@ -232,11 +321,11 @@ func importFn(redis string, file string) {
 	}
 
 	db := data.Db
-	if len(redisParts) > 1 {
-		db, _ = strconv.Atoi(redisParts[1])
+	if target.databaseSpecified {
+		db = target.databases[0]
 	}
 
-	importDataToDb(redisParts[0], db, data)
+	importDataToDb(target, db, data)
 	fmt.Printf("\nImport done, %d keys imported", len(data.Data))
 }
 
@@ -255,12 +344,8 @@ func validateData(data Data) error {
 	return nil
 }
 
-func importDataToDb(redisAddr string, db int, data Data) {
-	rdb := goRedis.NewClient(&goRedis.Options{
-		Addr:     redisAddr,
-		Password: "",
-		DB:       db,
-	})
+func importDataToDb(target redisTarget, db int, data Data) {
+	rdb := goRedis.NewClient(target.optionsForDatabase(db))
 	defer rdb.Close()
 
 	for key, record := range data.Data {
